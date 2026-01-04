@@ -1,54 +1,57 @@
-# Durable Objects Starter
+# Polymarket Tick Data API
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cloudflare/templates/tree/main/hello-world-do-template)
+基于 Cloudflare Workers + R2 SQL 的 Polymarket tick 数据查询 API。
 
-<!-- dash-content-start -->
-
-This is a [Durable Object](https://developers.cloudflare.com/durable-objects/) starter template. It comes with a `sayHello` method that returns `Hello World!`.
-
-<!-- dash-content-end -->
-
-Outside of this repo, you can start a new project with this template using [C3](https://developers.cloudflare.com/pages/get-started/c3/) (the `create-cloudflare` CLI):
-
-```bash
-npm create cloudflare@latest -- --template=cloudflare/templates/hello-world-do-template
-```
-
-## Getting Started
-
-First, run:
+## 部署
 
 ```bash
 npm install
-# or
-yarn install
-# or
-pnpm install
-# or
-bun install
+npx wrangler secret put R2_SQL_TOKEN  # 设置R2 SQL API Token
+npm run deploy
 ```
 
-Then run the development server (using the package manager of your choice):
+## API
+
+| 端点 | 说明 |
+|------|------|
+| `/api/price?token=<id>` | 通过token_id直接查询价格曲线 |
+| `/api/price?market=<slug>&token_index=0/1` | 通过market查询某个token的价格曲线 |
+| `/api/market/:slug` | 获取Polymarket市场信息 |
+| `/debug/sample?limit=N` | 查看样本数据 |
+| `/debug/sql?q=SQL` | 执行自定义SQL |
+
+### 参数
+
+- `token` - token_id，直接查询
+- `market` - 市场slug或condition_id
+- `token_index` - 0或1，选择market中的哪个token
+- `limit` - 返回条数（默认1000，最多5000）
+- `interval` - 采样粒度（秒），例如 `interval=5` 表示每5秒取一个点（2~3600）
+- `start`/`end` - 时间范围，支持ISO8601或Unix时间戳
+
+### 返回格式
+
+- `ts` - 原始Unix时间戳（秒）
+- `delta_ts` - 距离市场开始时间的秒数（正数=开始后，负数=开始前）
+
+### 示例
 
 ```bash
-npm run dev
+# 通过market查询全部token
+/api/price?market=eth-updown-15m-1767506400&limit=200
+
+# 仅查询token_index=1的价格
+/api/price?market=eth-updown-15m-1767506400&token_index=1&limit=100
+
+# 按5秒采样
+/api/price?market=eth-updown-15m-1767506400&interval=5
+
+# 直接用token_id查询（可选market用于计算ts基准）
+/api/price?token=4999...53692361&market=eth-updown-15m-1767506400
 ```
 
-Open [http://localhost:8787](http://localhost:8787) with your browser to see the result.
+## 数据源
 
-You can start editing the project by modifying `src/index.ts`.
-
-## Deploying To Production
-
-| Command             | Action                                |
-| :------------------ | :------------------------------------ |
-| `npm run deploy`    | Deploy your application to Cloudflare |
-| `npm wrangler tail` | View real-time logs for all Workers   |
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Durable Objects](https://developers.cloudflare.com/durable-objects/) - learn about Durable Objects
-
-Your feedback and contributions are welcome!
+- **R2 Bucket**: `poly-orderbook`
+- **Iceberg Table**: `polymarket.orderbook`
+- 数据通过 Cloudflare Pipelines 从 WebSocket 入库
