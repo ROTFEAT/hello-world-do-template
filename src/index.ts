@@ -12,6 +12,8 @@ const ICEBERG_NAMESPACE = "polymarket";
 const ICEBERG_TABLE = "orderbook";
 const R2_SQL_API = `https://api.sql.cloudflarestorage.com/api/v1/accounts/${CLOUDFLARE_ACCOUNT_ID}/r2-sql/query/${R2_BUCKET_NAME}`;
 
+const MAX_SAMPLE_INTERVAL_SECONDS = 3600;
+
 // 类型定义
 interface PolymarketMarket {
 	conditionId: string;
@@ -22,8 +24,8 @@ interface PolymarketMarket {
 }
 
 interface PricePoint {
-	ts: number;
-	ts_delta: string | null;
+	ts: number;       // 原始Unix时间戳（秒）
+	delta_ts: number | null;  // 距离开始时间的秒数
 	price: number;
 }
 
@@ -98,9 +100,41 @@ function toUnixSeconds(value: unknown): number | null {
 	return Math.floor(ms / 1000);
 }
 
-function formatDelta(deltaSeconds: number): string {
-	const sign = deltaSeconds >= 0 ? '+' : '-';
-	return `${sign}${Math.abs(deltaSeconds)}s`;
+function parseDurationSegment(segment: string | undefined): number | null {
+	if (!segment) return null;
+	const match = /^(\d+)([smhd])$/i.exec(segment.trim());
+	if (!match) return null;
+	const value = Number(match[1]);
+	const unit = match[2].toLowerCase();
+	if (!Number.isFinite(value)) return null;
+	const multipliers: Record<string, number> = { s: 1, m: 60, h: 3600, d: 86400 };
+	const multiplier = multipliers[unit];
+	return multiplier ? value * multiplier : null;
+}
+
+function deriveSlugWindow(slug: string): { startTs: number | null; endTs: number | null } {
+	const parts = slug.split('-');
+	const startTs = parseSlugStartTs(slug);
+	if (startTs === null) return { startTs: null, endTs: null };
+	const durationSeconds = parseDurationSegment(parts[parts.length - 2]);
+	return { startTs, endTs: durationSeconds ? startTs + durationSeconds : null };
+}
+
+function secondsToIso(ts: number | null): string | null {
+	if (ts === null) return null;
+	const date = new Date(ts * 1000);
+	return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function parseSampleInterval(value: string | null): { value: number | null; error?: string } {
+	if (!value) return { value: null };
+	const num = Number(value);
+	if (!Number.isFinite(num)) return { value: null, error: 'interval 必须是数字（秒）' };
+	if (num < 2) return { value: null, error: 'interval 需大于等于 2 秒' };
+	if (num > MAX_SAMPLE_INTERVAL_SECONDS) {
+		return { value: null, error: `interval 不得超过 ${MAX_SAMPLE_INTERVAL_SECONDS} 秒` };
+	}
+	return { value: Math.floor(num) };
 }
 
 function normalizeQueryTimestamp(value: string | null): string | null {
@@ -130,6 +164,7 @@ async function fetchAssetPrices(params: {
 	start?: string | null;
 	end?: string | null;
 	baseTs: number | null;
+	sampleSeconds?: number | null;
 }): Promise<{ data: PricePoint[] } | { error: string }> {
 	let where = `asset_id = '${params.assetId}'`;
 	const startIso = normalizeQueryTimestamp(params.start ?? null);
@@ -145,17 +180,36 @@ async function fetchAssetPrices(params: {
 
 	const data: PricePoint[] = result.result.rows.reduce<PricePoint[]>((acc, row) => {
 		const price = Number(row.best_ask);
-		const ts = toUnixSeconds(row.timestamp);
-		if (Number.isNaN(price) || ts === null) return acc;
+		const unixTs = toUnixSeconds(row.timestamp);
+		if (Number.isNaN(price) || unixTs === null) return acc;
 		acc.push({
-			ts,
-			ts_delta: params.baseTs === null ? null : formatDelta(ts - params.baseTs),
+			ts: unixTs,
+			delta_ts: params.baseTs === null ? null : unixTs - params.baseTs,
 			price
 		});
 		return acc;
 	}, []);
 
-	return { data: data.sort((a, b) => a.ts - b.ts) };
+	const sorted = data.sort((a, b) => a.ts - b.ts);
+	return { data: applySampling(sorted, params.sampleSeconds) };
+}
+
+function applySampling(points: PricePoint[], intervalSeconds?: number | null): PricePoint[] {
+	if (!intervalSeconds || intervalSeconds <= 1 || !points.length) return points;
+	const sampled: PricePoint[] = [];
+	let lastBucket: number | null = null;
+	for (const point of points) {
+		// 使用delta_ts分桶（如果有），否则使用ts
+		const timeVal = point.delta_ts ?? point.ts;
+		const bucket = Math.floor(timeVal / intervalSeconds);
+		if (lastBucket === bucket && sampled.length) {
+			sampled[sampled.length - 1] = point;
+			continue;
+		}
+		sampled.push(point);
+		lastBucket = bucket;
+	}
+	return sampled;
 }
 
 // JSON响应
@@ -197,104 +251,111 @@ export default {
 			return json(await executeR2Sql(q, token));
 		}
 
-		// API: /api/price?slug=...&limit=...&side=...
+		// API: /api/price?token=<token_id> 或 /api/price?market=<slug>&token_index=0/1
 		if (pathname === '/api/price') {
-			const slugOrId = url.searchParams.get('slug');
-			if (!slugOrId) return json({ error: 'Missing slug parameter', example: '/api/price?slug=eth-updown-15m-1767506400' }, 400);
-
-			const sideParam = url.searchParams.get('side');
+			const tokenId = url.searchParams.get('token');
+			const marketSlug = url.searchParams.get('market');
 			const limit = parseInt(url.searchParams.get('limit') || '1000', 10);
-			const start = url.searchParams.get('start');
-			const end = url.searchParams.get('end');
+			const startParam = url.searchParams.get('start');
+			const endParam = url.searchParams.get('end');
+			const intervalRaw = url.searchParams.get('interval') ?? url.searchParams.get('sample');
+			const interval = parseSampleInterval(intervalRaw);
+			if (interval.error) return json({ error: interval.error, hint: '示例：interval=5 表示5秒采样' }, 400);
 
-			const market = await getMarketBySlug(slugOrId) || await getMarketByConditionId(slugOrId);
-			if (!market) return json({ error: 'Market not found', message: `slug or condition_id: ${slugOrId}` }, 404);
+			// 模式1: 直接通过token_id查询
+			if (tokenId) {
+				const slugHint = marketSlug;
+				const baseTs = slugHint ? parseSlugStartTs(slugHint) : null;
+				const slugWindow = slugHint ? deriveSlugWindow(slugHint) : { startTs: null, endTs: null };
+				const effectiveStart = startParam ?? secondsToIso(slugWindow.startTs);
+				const effectiveEnd = endParam ?? secondsToIso(slugWindow.endTs);
 
-			let tokenIds: string[], outcomes: string[];
-			try {
-				tokenIds = JSON.parse(market.clobTokenIds);
-				outcomes = JSON.parse(market.outcomes);
-			} catch {
-				return json({ error: 'Failed to parse market token data' }, 500);
-			}
-			if (!tokenIds.length) return json({ error: 'No tokens found' }, 404);
-
-			const tokens = tokenIds.map((tokenId, index) => ({
-				token_id: tokenId,
-				outcome: outcomes[index] || `Token ${index + 1}`,
-				index
-			}));
-
-			let selectedTokens = tokens;
-			if (sideParam) {
-				const normalized = sideParam.trim().toLowerCase();
-				selectedTokens = tokens.filter(t => t.token_id === sideParam || t.outcome?.trim().toLowerCase() === normalized || String(t.index) === normalized);
-				if (!selectedTokens.length) {
-					return json({ error: `side '${sideParam}' not found`, available: tokens.map(t => ({ index: t.index, outcome: t.outcome, token_id: t.token_id })) }, 404);
-				}
-			}
-
-			const marketInfo = { condition_id: market.conditionId, slug: market.slug, question: market.question };
-			const startTs = parseSlugStartTs(market.slug);
-
-			const data = [];
-			for (const tkn of selectedTokens) {
 				const series = await fetchAssetPrices({
-					assetId: tkn.token_id,
+					assetId: tokenId,
 					limit,
 					sqlToken: token,
-					start,
-					end,
-					baseTs: startTs
+					start: effectiveStart,
+					end: effectiveEnd,
+					baseTs,
+					sampleSeconds: interval.value
 				});
-				if ('error' in series) {
-					return json({ market: { ...marketInfo, token_id: tkn.token_id }, error: series.error }, 500);
-				}
-				data.push({ token_id: tkn.token_id, outcome: tkn.outcome, side_index: tkn.index, prices: series.data });
+
+				if ('error' in series) return json({ error: series.error, token_id: tokenId }, 500);
+
+				return json({
+					token_id: tokenId,
+					market: slugHint || null,
+					query: { token: tokenId, limit: clampLimit(limit), interval: interval.value, start: effectiveStart, end: effectiveEnd },
+					count: series.data.length,
+					data: series.data
+				});
 			}
 
-			const totalCount = data.reduce((sum, entry) => sum + entry.prices.length, 0);
+			// 模式2: 通过market + token_index查询
+			if (marketSlug) {
+				const tokenIndexParam = url.searchParams.get('token_index');
+				const market = await getMarketBySlug(marketSlug) || await getMarketByConditionId(marketSlug);
+				if (!market) return json({ error: 'Market not found', market: marketSlug }, 404);
+
+				let tokenIds: string[], outcomes: string[];
+				try {
+					tokenIds = JSON.parse(market.clobTokenIds);
+					outcomes = JSON.parse(market.outcomes);
+				} catch {
+					return json({ error: 'Failed to parse market token data' }, 500);
+				}
+				if (!tokenIds.length) return json({ error: 'No tokens found' }, 404);
+
+				const tokens = tokenIds.map((id, idx) => ({ token_id: id, outcome: outcomes[idx] || `Token ${idx}`, index: idx }));
+
+				let selectedTokens = tokens;
+				if (tokenIndexParam !== null) {
+					const idx = parseInt(tokenIndexParam, 10);
+					if (isNaN(idx) || idx < 0 || idx >= tokens.length) {
+						return json({ error: `token_index '${tokenIndexParam}' 无效`, available: tokens.map(t => ({ index: t.index, outcome: t.outcome })) }, 400);
+					}
+					selectedTokens = [tokens[idx]];
+				}
+
+				const marketInfo = { condition_id: market.conditionId, slug: market.slug, question: market.question };
+				const startTs = parseSlugStartTs(market.slug);
+				const slugWindow = deriveSlugWindow(market.slug);
+				const effectiveStart = startParam ?? secondsToIso(slugWindow.startTs);
+				const effectiveEnd = endParam ?? secondsToIso(slugWindow.endTs);
+
+				const data = [];
+				for (const tkn of selectedTokens) {
+					const series = await fetchAssetPrices({
+						assetId: tkn.token_id,
+						limit,
+						sqlToken: token,
+						start: effectiveStart,
+						end: effectiveEnd,
+						baseTs: startTs,
+						sampleSeconds: interval.value
+					});
+					if ('error' in series) {
+						return json({ market: { ...marketInfo, token_id: tkn.token_id }, error: series.error }, 500);
+					}
+					data.push({ token_id: tkn.token_id, outcome: tkn.outcome, token_index: tkn.index, prices: series.data });
+				}
+
+				const totalCount = data.reduce((sum, entry) => sum + entry.prices.length, 0);
+				return json({
+					market: { ...marketInfo, tokens: tokens.map(t => ({ token_id: t.token_id, outcome: t.outcome, index: t.index })) },
+					query: { market: marketSlug, token_index: tokenIndexParam ? parseInt(tokenIndexParam, 10) : null, limit: clampLimit(limit), interval: interval.value, start: effectiveStart, end: effectiveEnd },
+					count: totalCount,
+					data
+				});
+			}
+
 			return json({
-				market: { ...marketInfo, tokens: tokens.map(t => ({ token_id: t.token_id, outcome: t.outcome })) },
-				query: { slug: slugOrId, side: sideParam || null, limit: clampLimit(limit), start: start || null, end: end || null },
-				count: totalCount,
-				data
-			});
-		}
-
-		// 兼容旧路径提示
-		if (pathname.startsWith('/api/price/')) {
-			return json({ error: 'API 已更新', message: '请改用 /api/price?slug=...&limit=...&side=...' }, 400);
-		}
-
-		// API: /api/token?token=...
-		if (pathname === '/api/token') {
-			const tokenId = url.searchParams.get('token');
-			if (!tokenId) return json({ error: 'Missing token parameter', example: '/api/token?token=<token_id>' }, 400);
-			const limit = parseInt(url.searchParams.get('limit') || '1000', 10);
-			const start = url.searchParams.get('start');
-			const end = url.searchParams.get('end');
-			const slugHint = url.searchParams.get('slug');
-			const baseTs = slugHint ? parseSlugStartTs(slugHint) : null;
-
-			const series = await fetchAssetPrices({
-				assetId: tokenId,
-				limit,
-				sqlToken: token,
-				start,
-				end,
-				baseTs
-			});
-
-			if ('error' in series) return json({ error: series.error, token_id: tokenId }, 500);
-
-			return json({
-				token_id: tokenId,
-				slug: slugHint || null,
-				query: { token: tokenId, limit: clampLimit(limit), start: start || null, end: end || null },
-				count: series.data.length,
-				data: series.data
-			});
+				error: 'Missing parameters',
+				usage: [
+					'/api/price?token=<token_id>',
+					'/api/price?market=<slug>&token_index=0/1'
+				]
+			}, 400);
 		}
 
 		// API: /api/market/:slug
@@ -312,8 +373,8 @@ export default {
 				status: token ? 'ready' : 'R2_SQL_TOKEN not configured',
 				config: { namespace: ICEBERG_NAMESPACE, table: ICEBERG_TABLE, bucket: R2_BUCKET_NAME },
 				endpoints: {
-					'/api/price': { description: '根据slug获取价格', params: { slug: '市场slug', side: 'Up/Down/索引', limit: '每个token条数', start: '开始时间', end: '结束时间' } },
-					'/api/token': { description: '根据token_id获取价格', params: { token: 'token_id', limit: '条数', start: '开始', end: '结束' } },
+					'/api/price?token=<id>': { description: '通过token_id查询价格', params: { token: 'token_id', market: '可选slug', limit: '条数', interval: '采样秒' } },
+					'/api/price?market=<slug>': { description: '通过market查询价格', params: { market: 'slug', token_index: '0或1', limit: '条数', interval: '采样秒' } },
 					'/api/market/:slug': { description: '获取市场信息' },
 					'/debug/sample': { description: '样本数据', params: { limit: '条数' } },
 					'/debug/sql': { description: '自定义SQL', params: { q: 'SQL语句' } }
